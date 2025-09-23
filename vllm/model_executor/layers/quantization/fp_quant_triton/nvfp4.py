@@ -5,14 +5,18 @@ import triton
 import triton.language as tl
 
 
+def get_autotuning_config(configs, named_args, **kwargs):
+    hadamard_dim = kwargs["hadamard_dim"]
+    # Block size has to be chosen such, that BLOCK_SIZE // hadamard_dim is multiple of 16
+    BLOCK_SIZES = [32 * 32, 64 * 32, 128 * 32, 256 * 32, 512 * 32]
+    for block_size in BLOCK_SIZES:
+        if block_size // hadamard_dim % 16 == 0:
+            configs.append(triton.Config({"BLOCK_SIZE": block_size}))
+
+
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 32 * 32}),
-        triton.Config({"BLOCK_SIZE": 64 * 32}),
-        triton.Config({"BLOCK_SIZE": 128 * 32}),
-        triton.Config({"BLOCK_SIZE": 256 * 32}),
-        triton.Config({"BLOCK_SIZE": 512 * 32}),
-    ],
+    configs=[triton.Config({})],
+    prune_configs_by={"early_config_prune": get_autotuning_config},
     key=[],
 )
 @triton.jit
