@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.quantization.fp_quant_triton.mxfp4 import mxfp4_forward_kernel_wrapper
+from vllm.model_executor.layers.quantization.fp_quant_triton.mxfp4_deluxe import mxfp4_deluxe_forward_kernel_wrapper
 from vllm.model_executor.layers.quantization.fp_quant_triton.nvfp4 import nvfp4_forward_kernel_wrapper
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -56,6 +57,8 @@ class FPQuantConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert
         if not self.pseudoquantization and not CUTLASS_FOUND:
             raise ValueError("qutlass not found, using fake implementations")
+        if not self.pseudoquantization and self.forward_dtype == "mxfp4_deluxe":
+            raise ValueError("mxfp4_deluxe not supported in QuTLASS")
 
     def __repr__(self) -> str:
         return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
@@ -126,8 +129,8 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "weight shape. This can be caused by too large "
                 "tensor parallel size. Or other skill issues.")
 
-        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4"], "Only mxfp4 and nvfp4 are supported for now"
-        if self.quant_config.forward_dtype == "mxfp4":
+        assert self.quant_config.forward_dtype in ["mxfp4", "mxfp4_deluxe", "nvfp4"], "Only mxfp4 and nvfp4 are supported for now"
+        if self.quant_config.forward_dtype in ["mxfp4", "mxfp4_deluxe"]:
             group_size = 32
         elif self.quant_config.forward_dtype == "nvfp4":
             group_size = 16
@@ -221,6 +224,24 @@ class FPQuantLinearMethod(LinearMethodBase):
         )
         set_weight_attrs(backward_hadamard_matrix, {"ignore_warning": True} | extra_weight_attrs)
         layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
+
+        if self.quant_config.forward_dtype == "mxfp4_deluxe":
+            logscales_min = Parameter(
+                torch.empty(1, dtype=torch.float32),
+                requires_grad=False,
+            )
+            set_weight_attrs(logscales_min, {"ignore_warning": True} | extra_weight_attrs)
+            layer.register_parameter("logscales_min", logscales_min)
+            
+            logscales_max = Parameter(
+                torch.empty(1, dtype=torch.float32),
+                requires_grad=False,
+            )
+            set_weight_attrs(logscales_max, {"ignore_warning": True} | extra_weight_attrs)
+            layer.register_parameter("logscales_max", logscales_max)
+        else:
+            self.logscales_min = None
+            self.logscales_max = None
 
 
     def apply(
@@ -359,7 +380,17 @@ def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: tor
     return y
 
 
-def pseudoquantized_forward(x: torch.Tensor, dqweight: torch.Tensor, act_global_scale: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str, forward_dtype: str) -> torch.Tensor:    
+def pseudoquantized_forward(
+    x: torch.Tensor, 
+    dqweight: torch.Tensor, 
+    act_global_scale: torch.Tensor, 
+    bias: Optional[torch.Tensor], 
+    forward_hadamard_matrix: torch.Tensor, 
+    logscales_min: Optional[torch.Tensor], 
+    logscales_max: Optional[torch.Tensor],
+    forward_method: str, 
+    forward_dtype: str
+) -> torch.Tensor:    
     x_flat = x.contiguous().flatten(end_dim=-2)
 
     # Pseudoquantize input
@@ -369,6 +400,13 @@ def pseudoquantized_forward(x: torch.Tensor, dqweight: torch.Tensor, act_global_
             forward_hadamard_matrix,
             gaussian_scale=2.92247856 / 6.0 if forward_method == "quest" else 3.0 / 4.0,
             quest=forward_method == "quest",
+        )
+    elif forward_dtype == "mxfp4_deluxe":
+        x_flat_dq, _ = mxfp4_deluxe_forward_kernel_wrapper(
+            x_flat,
+            forward_hadamard_matrix,
+            logscales_min=logscales_min,
+            logscales_max=logscales_max,
         )
     elif forward_dtype == "nvfp4":
         x_flat_dq = nvfp4_forward_kernel_wrapper(
