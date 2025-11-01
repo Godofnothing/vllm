@@ -159,7 +159,6 @@ class FPQuantLinearMethod(LinearMethodBase):
             )
             layer.register_parameter("dqweight", dqweight)
         else:
-        
             qweight = Parameter(
                 torch.empty(
                     sum(output_partition_sizes),
@@ -197,7 +196,6 @@ class FPQuantLinearMethod(LinearMethodBase):
                 } | extra_weight_attrs,
             )
             layer.register_parameter("scales", scales)
-
 
         weight_global_scale = Parameter(
             torch.empty(1, dtype=torch.float32),
