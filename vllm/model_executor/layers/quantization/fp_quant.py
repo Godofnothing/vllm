@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.quantization.fp_quant_triton.mxfp4 import mxfp4_forward_kernel_wrapper
 from vllm.model_executor.layers.quantization.fp_quant_triton.nvfp4 import nvfp4_forward_kernel_wrapper
+from vllm.model_executor.layers.quantization.int_quant_triton.nvint4 import nvint4_forward_kernel_wrapper
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
@@ -56,6 +57,8 @@ class FPQuantConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert
         if not self.pseudoquantization and not CUTLASS_FOUND:
             raise ValueError("qutlass not found, using fake implementations")
+        if not self.pseudoquantization and self.forward_dtype == "nvint4":
+            raise ValueError("nvint4 not supported in QuTLASS")
 
     def __repr__(self) -> str:
         return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
@@ -130,6 +133,8 @@ class FPQuantLinearMethod(LinearMethodBase):
         if self.quant_config.forward_dtype == "mxfp4":
             group_size = 32
         elif self.quant_config.forward_dtype == "nvfp4":
+            group_size = 16
+        elif self.quant_config.forward_dtype == "nvint4":
             group_size = 16
         else:
             raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
@@ -351,11 +356,11 @@ def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: tor
         y = torch.ops.vllm.matmul_nvf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1 / (weight_global_scale * act_global_scale))
     else:
         raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
-    
+
     y = y.view(*x.shape[:-1], y.shape[-1])
     if bias is not None:
         y += bias
-    
+
     return y
 
 
@@ -376,10 +381,15 @@ def pseudoquantized_forward(x: torch.Tensor, dqweight: torch.Tensor, act_global_
             forward_hadamard_matrix,
             act_global_scale,
         )
+    elif forward_dtype == "nvint4":
+        x_flat_dq = nvint4_forward_kernel_wrapper(
+            x_flat,
+            forward_hadamard_matrix,
+            act_global_scale,
+        )
     else:
         raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
 
     y = torch.nn.functional.linear(x_flat_dq, dqweight, bias)
 
     return y.unflatten(dim=0, sizes=x.shape[:-1])
-    
