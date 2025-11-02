@@ -251,9 +251,28 @@ class FPQuantLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.quant_config.pseudoquantization:
-            return pseudoquantized_forward(x, layer.dqweight, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
+            return pseudoquantized_forward(
+                x, 
+                layer.dqweight, 
+                layer.act_global_scale, 
+                bias, 
+                layer.forward_hadamard_matrix, 
+                getattr(layer, "logscales_min", None), 
+                getattr(layer, "logscales_max", None), 
+                self.quant_config.forward_method, 
+                self.quant_config.forward_dtype
+            )
         else:
-            return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
+            return quantized_forward(
+                x, 
+                layer.qweight, 
+                layer.scales, 
+                layer.weight_global_scale, 
+                layer.act_global_scale, bias, 
+                layer.forward_hadamard_matrix, 
+                self.quant_config.forward_method, 
+                self.quant_config.forward_dtype
+            )
 
 
 def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
