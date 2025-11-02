@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp_quant_triton.mxfp4 import mxfp4_forward_kernel_wrapper
 from vllm.model_executor.layers.quantization.fp_quant_triton.nvfp4 import nvfp4_forward_kernel_wrapper
 from vllm.model_executor.layers.quantization.int_quant_triton.nvint4 import nvint4_forward_kernel_wrapper
+from vllm.model_executor.layers.quantization.int_quant_triton.nvint4v2 import nvint4v2_forward_kernel_wrapper
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
@@ -57,7 +58,7 @@ class FPQuantConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert
         if not self.pseudoquantization and not CUTLASS_FOUND:
             raise ValueError("qutlass not found, using fake implementations")
-        if not self.pseudoquantization and self.forward_dtype == "nvint4":
+        if not self.pseudoquantization and self.forward_dtype in ["nvint4", "nvint4v2"]:
             raise ValueError("nvint4 not supported in QuTLASS")
 
     def __repr__(self) -> str:
@@ -129,12 +130,12 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "weight shape. This can be caused by too large "
                 "tensor parallel size. Or other skill issues.")
 
-        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4", "nvint4"], "Only mxfp4 and nvfp4 are supported for now"
+        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4", "nvint4", "nvint4v2"], "Only mxfp4 and nvfp4 are supported for now"
         if self.quant_config.forward_dtype == "mxfp4":
             group_size = 32
         elif self.quant_config.forward_dtype == "nvfp4":
             group_size = 16
-        elif self.quant_config.forward_dtype == "nvint4":
+        elif self.quant_config.forward_dtype in ["nvint4", "nvint4v2"]:
             group_size = 16
         else:
             raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
@@ -381,6 +382,13 @@ def pseudoquantized_forward(x: torch.Tensor, dqweight: torch.Tensor, act_global_
         )
     elif forward_dtype == "nvint4":
         x_flat_dq = nvint4_forward_kernel_wrapper(
+            x_flat,
+            forward_hadamard_matrix,
+            act_global_scale,
+        )
+        x_flat_dq = x_flat.reshape(-1, forward_hadamard_matrix.shape[0]).mm(forward_hadamard_matrix).reshape(x_flat.shape)
+    elif forward_dtype == "nvint4v2":
+        x_flat_dq = nvint4v2_forward_kernel_wrapper(
             x_flat,
             forward_hadamard_matrix,
             act_global_scale,
