@@ -129,7 +129,7 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "weight shape. This can be caused by too large "
                 "tensor parallel size. Or other skill issues.")
 
-        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4"], "Only mxfp4 and nvfp4 are supported for now"
+        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4", "nvint4"], "Only mxfp4 and nvfp4 are supported for now"
         if self.quant_config.forward_dtype == "mxfp4":
             group_size = 32
         elif self.quant_config.forward_dtype == "nvfp4":

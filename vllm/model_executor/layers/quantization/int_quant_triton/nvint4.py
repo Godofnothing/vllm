@@ -59,24 +59,25 @@ def nvint4_forward_kernel(
     x_tr_abs = x_tr.abs()
     sign = 2 * (x_tr > 0) - 1
     scales = tl.max(x_tr_abs, axis=-1, keep_dims=True)
-    scales_int8 = (int_round(scales * global_scale, 0, UINT8_MAX).to(tl.float32) / global_scale).to(x.dtype)
+    scales = global_scale * scales / INT4_MAX
+    scales_int8 = (int_round(scales, 0, UINT8_MAX).to(tl.float32) / global_scale).to(x.dtype)
 
-    x_tr_scaled = INT4_MAX * x_tr_abs / scales_int8
+    x_tr_scaled = x_tr_abs / scales_int8
 
     # Round to FP4 grid
     q = int_round(x_tr_scaled, INT4_MIN, INT4_MAX)
 
     # Dequantize
-    q = q * sign * scales_int8 / INT4_MAX
+    q = q * sign * scales_int8
     # Reshape to original shape
     q = q.reshape(BLOCK_SIZE)
     tl.store(q_ptr + offs, q, offs < N)
 
 
 def nvint4_forward_kernel_wrapper(
-    x: torch.Tensor, 
+    x: torch.Tensor,
     transform: torch.Tensor,
-    global_scale: torch.Tensor, 
+    global_scale: torch.Tensor,
 ):
     x_numel = x.numel()
     x_q = torch.empty_like(x)
