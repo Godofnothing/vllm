@@ -4,9 +4,10 @@
 # Supports FP-Quant compression, see https://arxiv.org/abs/2505.14669
 
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
@@ -26,6 +27,10 @@ except ImportError:
 
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
+    FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize,
+    FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
@@ -97,6 +102,10 @@ class FPQuantConfig(QuantizationConfig):
         
         if isinstance(layer, LinearBase):
             return FPQuantLinearMethod(self)
+
+        elif isinstance(layer, FusedMoE):
+            return FPQuantMoEMethod(self)
+        
         return None
 
 
@@ -233,6 +242,164 @@ class FPQuantLinearMethod(LinearMethodBase):
             return pseudoquantized_forward(x, layer.dqweight, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
         else:
             return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
+
+
+class FPQuantMoEMethod(FusedMoEMethodBase):
+    """MoE method for FPQuant.
+    Supports loading FPQuant checkpoints with static weight scale and
+    dynamic/static activation scale.
+
+    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
+    activation scaling. The weight scaling factor will be initialized after
+    the model weights are loaded.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: FPQuantConfig):
+        self.quant_config = quant_config
+        if not self.quant_config.pseudoquantization:
+            raise NotImplementedError("MoE is supported only for pseudoquantized FPQuant models.")
+
+    def create_weights(self, layer: nn.Module, num_experts: int, hidden_size: int,
+                       intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        layer.hidden_size = hidden_size
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+
+        if self.quant_config.pseudoquantization:
+            # WEIGHTS
+            w13_dqweight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size,
+                    dtype=params_dtype
+                ),
+                requires_grad=False
+            )
+            layer.register_parameter("w13_dqweight", w13_dqweight)
+            set_weight_attrs(w13_dqweight, extra_weight_attrs)
+
+            w2_dqweight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    dtype=params_dtype
+                ),
+                requires_grad=False
+            )
+            layer.register_parameter("w2_dqweight", w2_dqweight)
+            set_weight_attrs(w2_dqweight, extra_weight_attrs)
+        else:
+            raise NotImplementedError("MoE is supported only for pseudoquantized FPQuant models.")
+
+        weight_global_scale = Parameter(
+            torch.empty(1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_global_scale, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("weight_global_scale", weight_global_scale)
+        
+        act_global_scale = Parameter(
+            torch.empty(1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(act_global_scale, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("act_global_scale", act_global_scale)   
+            
+        forward_hadamard_matrix = Parameter(
+            torch.empty(self.quant_config.hadamard_group_size, self.quant_config.hadamard_group_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(forward_hadamard_matrix, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
+        
+        backward_hadamard_matrix = Parameter(
+            torch.empty(self.quant_config.hadamard_group_size, self.quant_config.hadamard_group_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(backward_hadamard_matrix, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
+        
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if enable_eplb:
+            assert expert_load_view is not None
+            assert logical_to_physical_map is not None
+            assert logical_replica_count is not None
+            assert isinstance(layer, FusedMoE) 
+        pass
+
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            indices_type=self.topk_indices_dtype,
+            enable_eplb=enable_eplb,
+            expert_map=expert_map,
+            expert_load_view=expert_load_view,
+            logical_to_physical_map=logical_to_physical_map,
+            logical_replica_count=logical_replica_count,
+        )
+
+        if self.quant_config.pseudoquantization:
+            if self.quant_config.forward_dtype == "mxfp4":
+                x, _ = mxfp4_forward_kernel_wrapper(x, layer.forward_hadamard_matrix)
+            elif self.quant_config.forward_dtype == "nvfp4":
+                x = nvfp4_forward_kernel_wrapper(x, layer.forward_hadamard_matrix, layer.act_global_scale)
+            else:
+                raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
+
+        if self.quant_config.pseudoquantization:
+            return self.fused_experts(
+                hidden_states=x,
+                w1=layer.w13_dqweight,
+                w2=layer.w2_dqweight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_map=expert_map,
+            )
+        else:
+            raise NotImplementedError("MoE is supported only for pseudoquantized FPQuant models.")
 
 
 def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
